@@ -1988,6 +1988,9 @@ dump_object(objset_t *os, uint64_t object, int verbosity, int *print_header,
 	if (dnode_slots_used)
 		*dnode_slots_used = doi.doi_dnodesize / DNODE_MIN_SIZE;
 
+	if (dnode_slots_used)
+		*dnode_slots_used = doi.doi_dnodesize / DNODE_MIN_SIZE;
+
 	zdb_nicenum(doi.doi_metadata_block_size, iblk);
 	zdb_nicenum(doi.doi_data_block_size, dblk);
 	zdb_nicenum(doi.doi_max_offset, lsize);

@@ -19,32 +19,26 @@
 #
 # CDDL HEADER END
 #
-
-#
 # Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
 
-#
-# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
-#
-
 . $STF_SUITE/include/libtest.shlib
-. $STF_SUITE/tests/functional/slog/slog.cfg
+# . $STF_SUITE/tests/functional/xattr/xattr_common.kshlib
 
-verify_runnable "global"
+#
+# DESCRIPTION:
+#
+# Verify [acm]time is modified appropriately with xattr=on|sa
 
-if ! verify_slog_support ; then
-	log_unsupported "This system doesn't support separate intent logs"
-fi
+set -A args "sa" "on"
 
-if [[ -d $VDEV ]]; then
-	log_must rm -rf $VDIR
-fi
-if [[ -d $VDEV2 ]]; then
-	log_must rm -rf $VDIR2
-fi
-log_must mkdir -p $VDIR $VDIR2
-log_must truncate -s $MINVDEVSIZE $VDEV $SDEV $LDEV $VDEV2 $SDEV2 $LDEV2
+log_note "Verify [acm]time is modified appropriately."
 
-log_pass
+for arg in ${args[*]}; do
+	log_note "Testing with xattr set to $arg"
+	log_must zfs set xattr=$arg $TESTPOOL
+	log_must $STF_SUITE/tests/functional/ctime/ctime
+done
+
+log_pass "PASS"
