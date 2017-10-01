@@ -730,7 +730,7 @@ BIO_END_IO_PROTO(vdev_disk_io_discard_completion, bio, error)
 
 	if (dr->dr_error == 0) {
 #ifdef HAVE_1ARG_BIO_END_IO_T
-		dr->dr_error = -(bio->bi_error);
+		dr->dr_error = -(bio->bi_status);
 #else
 		dr->dr_error = -(error);
 #endif
