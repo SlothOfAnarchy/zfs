@@ -1153,6 +1153,18 @@ dnode_buf_evict_async(void *dbu)
 }
 
 /*
+ * When the DNODE_MUST_BE_FREE flag is set, the "slots" parameter is used
+ * to ensure the hole at the specified object offset is large enough to
+ * hold the dnode being created. The slots parameter is also used to ensure
+ * a dnode does not span multiple dnode blocks. In both of these cases, if
+ * a failure occurs, ENOSPC is returned. Keep in mind, these failure cases
+ * are only possible when using DNODE_MUST_BE_FREE.
+ *
+ * If the DNODE_MUST_BE_ALLOCATED flag is set, "slots" must be 0.
+ * dnode_hold_impl() will check if the requested dnode is already consumed
+ * as an extra dnode slot by an large dnode, in which case it returns
+ * ENOENT.
+ *
  * errors:
  * EINVAL - Invalid object number or flags.
  * ENOSPC - Hole too small to fulfill "slots" request (DNODE_MUST_BE_FREE)
@@ -1228,7 +1240,12 @@ dnode_hold_impl(objset_t *os, uint64_t object, int flag, int slots,
 		DNODE_STAT_BUMP(dnode_hold_dbuf_hold);
 		return (SET_ERROR(EIO));
 	}
-	err = dbuf_read(db, NULL, DB_RF_CANFAIL);
+
+	/*
+	 * We do not need to decrypt to read the dnode so it doesn't matter
+	 * if we get the encrypted or decrypted version.
+	 */
+	err = dbuf_read(db, NULL, DB_RF_CANFAIL | DB_RF_NO_DECRYPT);
 	if (err) {
 		DNODE_STAT_BUMP(dnode_hold_dbuf_read);
 		dbuf_rele(db, FTAG);
@@ -1401,7 +1418,7 @@ dnode_hold_impl(objset_t *os, uint64_t object, int flag, int slots,
 		mutex_exit(&dn->dn_mtx);
 		dnode_slots_rele(dnc, idx, slots);
 		dbuf_rele(db, FTAG);
-		return (type == DMU_OT_NONE ? ENOENT : EEXIST);
+		return (SET_ERROR(type == DMU_OT_NONE ? ENOENT : EEXIST));
 	}
 
 	if (refcount_add(&dn->dn_holds, tag) == 1)
@@ -1640,11 +1657,73 @@ fail:
 	return (SET_ERROR(ENOTSUP));
 }
 
+static void
+dnode_set_nlevels_impl(dnode_t *dn, int new_nlevels, dmu_tx_t *tx)
+{
+	uint64_t txgoff = tx->tx_txg & TXG_MASK;
+	int old_nlevels = dn->dn_nlevels;
+	dmu_buf_impl_t *db;
+	list_t *list;
+	dbuf_dirty_record_t *new, *dr, *dr_next;
+
+	ASSERT(RW_WRITE_HELD(&dn->dn_struct_rwlock));
+
+	dn->dn_nlevels = new_nlevels;
+
+	ASSERT3U(new_nlevels, >, dn->dn_next_nlevels[txgoff]);
+	dn->dn_next_nlevels[txgoff] = new_nlevels;
+
+	/* dirty the left indirects */
+	db = dbuf_hold_level(dn, old_nlevels, 0, FTAG);
+	ASSERT(db != NULL);
+	new = dbuf_dirty(db, tx);
+	dbuf_rele(db, FTAG);
+
+	/* transfer the dirty records to the new indirect */
+	mutex_enter(&dn->dn_mtx);
+	mutex_enter(&new->dt.di.dr_mtx);
+	list = &dn->dn_dirty_records[txgoff];
+	for (dr = list_head(list); dr; dr = dr_next) {
+		dr_next = list_next(&dn->dn_dirty_records[txgoff], dr);
+		if (dr->dr_dbuf->db_level != new_nlevels-1 &&
+		    dr->dr_dbuf->db_blkid != DMU_BONUS_BLKID &&
+		    dr->dr_dbuf->db_blkid != DMU_SPILL_BLKID) {
+			ASSERT(dr->dr_dbuf->db_level == old_nlevels-1);
+			list_remove(&dn->dn_dirty_records[txgoff], dr);
+			list_insert_tail(&new->dt.di.dr_children, dr);
+			dr->dr_parent = new;
+		}
+	}
+	mutex_exit(&new->dt.di.dr_mtx);
+	mutex_exit(&dn->dn_mtx);
+}
+
+int
+dnode_set_nlevels(dnode_t *dn, int nlevels, dmu_tx_t *tx)
+{
+	int ret = 0;
+
+	rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
+
+	if (dn->dn_nlevels == nlevels) {
+		ret = 0;
+		goto out;
+	} else if (nlevels < dn->dn_nlevels) {
+		ret = SET_ERROR(EINVAL);
+		goto out;
+	}
+
+	dnode_set_nlevels_impl(dn, nlevels, tx);
+
+out:
+	rw_exit(&dn->dn_struct_rwlock);
+	return (ret);
+}
+
 /* read-holding callers must not rely on the lock being continuously held */
 void
 dnode_new_blkid(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx, boolean_t have_read)
 {
-	uint64_t txgoff = tx->tx_txg & TXG_MASK;
 	int epbs, new_nlevels;
 	uint64_t sz;
 
@@ -1684,41 +1763,8 @@ dnode_new_blkid(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx, boolean_t have_read)
 
 	ASSERT3U(new_nlevels, <=, DN_MAX_LEVELS);
 
-	if (new_nlevels > dn->dn_nlevels) {
-		int old_nlevels = dn->dn_nlevels;
-		dmu_buf_impl_t *db;
-		list_t *list;
-		dbuf_dirty_record_t *new, *dr, *dr_next;
-
-		dn->dn_nlevels = new_nlevels;
-
-		ASSERT3U(new_nlevels, >, dn->dn_next_nlevels[txgoff]);
-		dn->dn_next_nlevels[txgoff] = new_nlevels;
-
-		/* dirty the left indirects */
-		db = dbuf_hold_level(dn, old_nlevels, 0, FTAG);
-		ASSERT(db != NULL);
-		new = dbuf_dirty(db, tx);
-		dbuf_rele(db, FTAG);
-
-		/* transfer the dirty records to the new indirect */
-		mutex_enter(&dn->dn_mtx);
-		mutex_enter(&new->dt.di.dr_mtx);
-		list = &dn->dn_dirty_records[txgoff];
-		for (dr = list_head(list); dr; dr = dr_next) {
-			dr_next = list_next(&dn->dn_dirty_records[txgoff], dr);
-			if (dr->dr_dbuf->db_level != new_nlevels-1 &&
-			    dr->dr_dbuf->db_blkid != DMU_BONUS_BLKID &&
-			    dr->dr_dbuf->db_blkid != DMU_SPILL_BLKID) {
-				ASSERT(dr->dr_dbuf->db_level == old_nlevels-1);
-				list_remove(&dn->dn_dirty_records[txgoff], dr);
-				list_insert_tail(&new->dt.di.dr_children, dr);
-				dr->dr_parent = new;
-			}
-		}
-		mutex_exit(&new->dt.di.dr_mtx);
-		mutex_exit(&dn->dn_mtx);
-	}
+	if (new_nlevels > dn->dn_nlevels)
+		dnode_set_nlevels_impl(dn, new_nlevels, tx);
 
 out:
 	if (have_read)
@@ -2077,7 +2123,8 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 			 */
 			return (SET_ERROR(ESRCH));
 		}
-		error = dbuf_read(db, NULL, DB_RF_CANFAIL | DB_RF_HAVESTRUCT);
+		error = dbuf_read(db, NULL,
+		    DB_RF_CANFAIL | DB_RF_HAVESTRUCT | DB_RF_NO_DECRYPT);
 		if (error) {
 			dbuf_rele(db, FTAG);
 			return (error);

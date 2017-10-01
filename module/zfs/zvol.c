@@ -34,7 +34,7 @@
  * Volumes are persistent through reboot and module load.  No user command
  * needs to be run before opening and using a device.
  *
- * Copyright 2014 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2016 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  */
@@ -451,7 +451,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	if (zv == NULL || zv->zv_objset == NULL) {
 		if (zv != NULL)
 			rw_exit(&zv->zv_suspend_lock);
-		if ((error = dmu_objset_own(name, DMU_OST_ZVOL, B_FALSE,
+		if ((error = dmu_objset_own(name, DMU_OST_ZVOL, B_FALSE, B_TRUE,
 		    FTAG, &os)) != 0) {
 			if (zv != NULL)
 				mutex_exit(&zv->zv_state_lock);
@@ -478,7 +478,7 @@ out:
 	kmem_free(doi, sizeof (dmu_object_info_t));
 
 	if (owned) {
-		dmu_objset_disown(os, FTAG);
+		dmu_objset_disown(os, B_TRUE, FTAG);
 		if (zv != NULL)
 			zv->zv_objset = NULL;
 	} else {
@@ -844,6 +844,8 @@ zvol_discard(void *arg)
 	start_jif = jiffies;
 	blk_generic_start_io_acct(zv->zv_queue, WRITE, bio_sectors(bio),
 	    &zv->zv_disk->part0);
+
+	sync = bio_is_fua(bio) || zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS;
 
 	sync = bio_is_fua(bio) || zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS;
 
@@ -1311,7 +1313,7 @@ zvol_first_open(zvol_state_t *zv)
 	}
 
 	/* lie and say we're read-only */
-	error = dmu_objset_own(zv->zv_name, DMU_OST_ZVOL, 1, zv, &os);
+	error = dmu_objset_own(zv->zv_name, DMU_OST_ZVOL, 1, 1, zv, &os);
 	if (error)
 		goto out_mutex;
 
@@ -1320,7 +1322,7 @@ zvol_first_open(zvol_state_t *zv)
 	error = zvol_setup_zv(zv);
 
 	if (error) {
-		dmu_objset_disown(os, zv);
+		dmu_objset_disown(os, 1, zv);
 		zv->zv_objset = NULL;
 	}
 
@@ -1338,7 +1340,7 @@ zvol_last_close(zvol_state_t *zv)
 
 	zvol_shutdown_zv(zv);
 
-	dmu_objset_disown(zv->zv_objset, zv);
+	dmu_objset_disown(zv->zv_objset, 1, zv);
 	zv->zv_objset = NULL;
 }
 
@@ -1347,9 +1349,9 @@ zvol_open(struct block_device *bdev, fmode_t flag)
 {
 	zvol_state_t *zv;
 	int error = 0;
-	boolean_t drop_suspend = B_FALSE;
+	boolean_t drop_suspend = B_TRUE;
 
-	ASSERT(!mutex_owned(&zvol_state_lock));
+	ASSERT(!MUTEX_HELD(&zvol_state_lock));
 
 	mutex_enter(&zvol_state_lock);
 	/*
@@ -1364,22 +1366,30 @@ zvol_open(struct block_device *bdev, fmode_t flag)
 		return (SET_ERROR(-ENXIO));
 	}
 
-	/* take zv_suspend_lock before zv_state_lock */
-	rw_enter(&zv->zv_suspend_lock, RW_READER);
-
 	mutex_enter(&zv->zv_state_lock);
-
 	/*
 	 * make sure zvol is not suspended during first open
-	 * (hold zv_suspend_lock), otherwise, drop the lock
+	 * (hold zv_suspend_lock) and respect proper lock acquisition
+	 * ordering - zv_suspend_lock before zv_state_lock
 	 */
 	if (zv->zv_open_count == 0) {
-		drop_suspend = B_TRUE;
+		if (!rw_tryenter(&zv->zv_suspend_lock, RW_READER)) {
+			mutex_exit(&zv->zv_state_lock);
+			rw_enter(&zv->zv_suspend_lock, RW_READER);
+			mutex_enter(&zv->zv_state_lock);
+			/* check to see if zv_suspend_lock is needed */
+			if (zv->zv_open_count != 0) {
+				rw_exit(&zv->zv_suspend_lock);
+				drop_suspend = B_FALSE;
+			}
+		}
 	} else {
-		rw_exit(&zv->zv_suspend_lock);
+		drop_suspend = B_FALSE;
 	}
-
 	mutex_exit(&zvol_state_lock);
+
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(zv->zv_open_count != 0 || RW_READ_HELD(&zv->zv_suspend_lock));
 
 	if (zv->zv_open_count == 0) {
 		error = zvol_first_open(zv);
@@ -1417,28 +1427,38 @@ static int
 zvol_release(struct gendisk *disk, fmode_t mode)
 {
 	zvol_state_t *zv;
-	boolean_t drop_suspend = B_FALSE;
+	boolean_t drop_suspend = B_TRUE;
 
-	ASSERT(!mutex_owned(&zvol_state_lock));
+	ASSERT(!MUTEX_HELD(&zvol_state_lock));
 
 	mutex_enter(&zvol_state_lock);
 	zv = disk->private_data;
-	ASSERT(zv && zv->zv_open_count > 0);
-
-	/* take zv_suspend_lock before zv_state_lock */
-	rw_enter(&zv->zv_suspend_lock, RW_READER);
 
 	mutex_enter(&zv->zv_state_lock);
-	mutex_exit(&zvol_state_lock);
-
+	ASSERT(zv->zv_open_count > 0);
 	/*
 	 * make sure zvol is not suspended during last close
-	 * (hold zv_suspend_lock), otherwise, drop the lock
+	 * (hold zv_suspend_lock) and respect proper lock acquisition
+	 * ordering - zv_suspend_lock before zv_state_lock
 	 */
-	if (zv->zv_open_count == 1)
-		drop_suspend = B_TRUE;
-	else
-		rw_exit(&zv->zv_suspend_lock);
+	if (zv->zv_open_count == 1) {
+		if (!rw_tryenter(&zv->zv_suspend_lock, RW_READER)) {
+			mutex_exit(&zv->zv_state_lock);
+			rw_enter(&zv->zv_suspend_lock, RW_READER);
+			mutex_enter(&zv->zv_state_lock);
+			/* check to see if zv_suspend_lock is needed */
+			if (zv->zv_open_count != 1) {
+				rw_exit(&zv->zv_suspend_lock);
+				drop_suspend = B_FALSE;
+			}
+		}
+	} else {
+		drop_suspend = B_FALSE;
+	}
+	mutex_exit(&zvol_state_lock);
+
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(zv->zv_open_count != 1 || RW_READ_HELD(&zv->zv_suspend_lock));
 
 	zv->zv_open_count--;
 	if (zv->zv_open_count == 0)
@@ -1781,7 +1801,7 @@ zvol_create_minor_impl(const char *name)
 
 	doi = kmem_alloc(sizeof (dmu_object_info_t), KM_SLEEP);
 
-	error = dmu_objset_own(name, DMU_OST_ZVOL, B_TRUE, FTAG, &os);
+	error = dmu_objset_own(name, DMU_OST_ZVOL, B_TRUE, B_TRUE, FTAG, &os);
 	if (error)
 		goto out_doi;
 
@@ -1847,7 +1867,7 @@ zvol_create_minor_impl(const char *name)
 
 	zv->zv_objset = NULL;
 out_dmu_objset_disown:
-	dmu_objset_disown(os, FTAG);
+	dmu_objset_disown(os, B_TRUE, FTAG);
 out_doi:
 	kmem_free(doi, sizeof (dmu_object_info_t));
 
@@ -1912,11 +1932,11 @@ zvol_prefetch_minors_impl(void *arg)
 	char *dsname = job->name;
 	objset_t *os = NULL;
 
-	job->error = dmu_objset_own(dsname, DMU_OST_ZVOL, B_TRUE, FTAG,
-	    &os);
+	job->error = dmu_objset_own(dsname, DMU_OST_ZVOL, B_TRUE, B_TRUE,
+	    FTAG, &os);
 	if (job->error == 0) {
 		dmu_prefetch(os, ZVOL_OBJ, 0, 0, 0, ZIO_PRIORITY_SYNC_READ);
-		dmu_objset_disown(os, FTAG);
+		dmu_objset_disown(os, B_TRUE, FTAG);
 	}
 }
 

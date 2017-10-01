@@ -27,6 +27,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/dsl_deleg.h \
 	$(top_srcdir)/include/sys/dsl_destroy.h \
 	$(top_srcdir)/include/sys/dsl_dir.h \
+	$(top_srcdir)/include/sys/dsl_crypt.h \
 	$(top_srcdir)/include/sys/dsl_pool.h \
 	$(top_srcdir)/include/sys/dsl_prop.h \
 	$(top_srcdir)/include/sys/dsl_scan.h \
@@ -68,6 +69,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/trace_dnode.h \
 	$(top_srcdir)/include/sys/trace_multilist.h \
 	$(top_srcdir)/include/sys/trace_txg.h \
+	$(top_srcdir)/include/sys/trace_vdev.h \
 	$(top_srcdir)/include/sys/trace_zil.h \
 	$(top_srcdir)/include/sys/trace_zio.h \
 	$(top_srcdir)/include/sys/trace_zrlock.h \
@@ -109,6 +111,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/zil_impl.h \
 	$(top_srcdir)/include/sys/zio_checksum.h \
 	$(top_srcdir)/include/sys/zio_compress.h \
+	$(top_srcdir)/include/sys/zio_crypt.h \
 	$(top_srcdir)/include/sys/zio.h \
 	$(top_srcdir)/include/sys/zio_impl.h \
 	$(top_srcdir)/include/sys/zio_priority.h \

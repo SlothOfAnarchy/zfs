@@ -21,11 +21,10 @@
 .\"
 .\" Copyright (c) 2007, Sun Microsystems, Inc. All Rights Reserved.
 .\" Copyright (c) 2013 by Delphix. All rights reserved.
-.\" Copyright 2016 Nexenta Systems, Inc.
 .\" Copyright (c) 2012 Cyril Plisko. All Rights Reserved.
 .\" Copyright (c) 2017 Datto Inc.
 .\" Copyright (c) 2017 George Melikov. All Rights Reserved.
-.\" Copyright (c) 2017 Datto Inc.
+.\" Copyright 2017 Nexenta Systems, Inc.
 .\"
 .Dd June 28, 2017
 .Dt ZPOOL 8 SMM
@@ -92,7 +91,7 @@
 .Nm
 .Cm import
 .Fl a
-.Op Fl DfmN
+.Op Fl DflmN
 .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
 .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
 .Op Fl o Ar mntopts
@@ -100,7 +99,7 @@
 .Op Fl R Ar root
 .Nm
 .Cm import
-.Op Fl Dfm
+.Op Fl Dflm
 .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
 .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
 .Op Fl o Ar mntopts
@@ -160,7 +159,7 @@
 .Ar pool
 .Nm
 .Cm split
-.Op Fl gLnP
+.Op Fl gLlnP
 .Oo Fl o Ar property Ns = Ns Ar value Oc Ns ...
 .Op Fl R Ar root
 .Ar pool newpool
@@ -1117,7 +1116,7 @@ Do not display headers, and separate fields by a single tab instead of arbitrary
 space.
 .It Fl o Ar field
 A comma-separated list of columns to display.
-.Sy name Ns , Ns Sy property Ns , Ns Sy value Ns , Ns Sy source
+.Sy name Ns \&, Ns Sy property Ns \&, Ns Sy value Ns \&, Ns Sy source
 is the default value.
 .It Fl p
 Display numbers in parsable (exact) values.
@@ -1186,7 +1185,7 @@ Lists destroyed pools only.
 .Nm
 .Cm import
 .Fl a
-.Op Fl DfmN
+.Op Fl DflmN
 .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
 .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
 .Op Fl o Ar mntopts
@@ -1237,6 +1236,15 @@ transactions.
 Not all damaged pools can be recovered by using this option.
 If successful, the data from the discarded transactions is irretrievably lost.
 This option is ignored if the pool is importable or already imported.
+.It Fl l
+Indicates that this command will request encryption keys for all encrypted
+datasets it attempts to mount as it is bringing the pool online. Note that if
+any datasets have a
+.Sy keylocation
+of
+.Sy prompt
+this command will block waiting for the keys to be entered. Without this flag
+encrypted datasets will be left unavailable until the keys are loaded.
 .It Fl m
 Allows a pool to import when there is a missing log device.
 Recent transactions can be lost because the log device will be discarded.
@@ -1298,7 +1306,7 @@ health of your pool and should only be used as a last resort.
 .It Xo
 .Nm
 .Cm import
-.Op Fl Dfm
+.Op Fl Dflm
 .Op Fl F Oo Fl n Oc Oo Fl t Oc Oo Fl T Oc Oo Fl X Oc
 .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
 .Op Fl o Ar mntopts
@@ -1357,6 +1365,15 @@ transactions.
 Not all damaged pools can be recovered by using this option.
 If successful, the data from the discarded transactions is irretrievably lost.
 This option is ignored if the pool is importable or already imported.
+.It Fl l
+Indicates that this command will request encryption keys for all encrypted
+datasets it attempts to mount as it is bringing the pool online. Note that if
+any datasets have a
+.Sy keylocation
+of
+.Sy prompt
+this command will block waiting for the keys to be entered. Without this flag
+encrypted datasets will be left unavailable until the keys are loaded.
 .It Fl m
 Allows a pool to import when there is a missing log device.
 Recent transactions can be lost because the log device will be discarded.
@@ -1828,9 +1845,11 @@ Stop scrubbing.
 .Bl -tag -width Ds
 .It Fl p
 Pause scrubbing.
-Scrub progress is periodically synced to disk so if the system
-is restarted or pool is exported during a paused scrub, the scrub will resume
-from the place where it was last checkpointed to disk.
+Scrub pause state and progress are periodically synced to disk.
+If the system is restarted or pool is exported during a paused scrub,
+even after import, scrub will remain paused until it is resumed.
+Once resumed the scrub will pick up from the place where it was last
+checkpointed to disk.
 To resume a paused scrub issue
 .Nm zpool Cm scrub
 again.
@@ -1849,7 +1868,7 @@ values.
 .It Xo
 .Nm
 .Cm split
-.Op Fl gLnP
+.Op Fl gLlnP
 .Oo Fl o Ar property Ns = Ns Ar value Oc Ns ...
 .Op Fl R Ar root
 .Ar pool newpool
@@ -1887,6 +1906,15 @@ Display real paths for vdevs resolving all symbolic links. This can
 be used to look up the current block device name regardless of the
 .Pa /dev/disk/
 path used to open it.
+.It Fl l
+Indicates that this command will request encryption keys for all encrypted
+datasets it attempts to mount as it is bringing the new pool online. Note that
+if any datasets have a
+.Sy keylocation
+of
+.Sy prompt
+this command will block waiting for the keys to be entered. Without this flag
+encrypted datasets will be left unavailable until the keys are loaded.
 .It Fl n
 Do dry run, do not actually perform the split.
 Print out the expected configuration of

@@ -22,8 +22,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2011, 2017 by Delphix. All rights reserved.
- * Copyright (c) 2015, Nexenta Systems, Inc.  All rights reserved.
- * Copyright (c) 2013, 2014, Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2016, Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright 2013 Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
@@ -160,6 +159,10 @@ static inline int spa_load_impl(spa_t *spa, uint64_t, nvlist_t *config,
     spa_load_state_t state, spa_import_type_t type, boolean_t mosconfig,
     char **ereport);
 static void spa_vdev_resilver_done(spa_t *spa);
+static void spa_auto_trim(spa_t *spa, uint64_t txg);
+static void spa_vdev_man_trim_done(spa_t *spa);
+static void spa_vdev_auto_trim_done(spa_t *spa);
+static uint64_t spa_min_trim_rate(spa_t *spa);
 
 uint_t		zio_taskq_batch_pct = 75;	/* 1 thread per cpu in pset */
 id_t		zio_taskq_psrset_bind = PS_NONE;
@@ -487,6 +490,8 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 		case ZPOOL_PROP_AUTOREPLACE:
 		case ZPOOL_PROP_LISTSNAPS:
 		case ZPOOL_PROP_AUTOEXPAND:
+		case ZPOOL_PROP_FORCETRIM:
+		case ZPOOL_PROP_AUTOTRIM:
 			error = nvpair_value_uint64(elem, &intval);
 			if (!error && intval > 1)
 				error = SET_ERROR(EINVAL);
@@ -1028,6 +1033,11 @@ spa_create_zio_taskqs(spa_t *spa)
 	}
 }
 
+/*
+ * Disabled until spa_thread() can be adapted for Linux.
+ */
+#undef HAVE_SPA_THREAD
+
 #if defined(_KERNEL) && defined(HAVE_SPA_THREAD)
 static void
 spa_thread(void *arg)
@@ -1164,6 +1174,8 @@ spa_activate(spa_t *spa, int mode)
 	    spa_error_entry_compare, sizeof (spa_error_entry_t),
 	    offsetof(spa_error_entry_t, se_avl));
 
+	spa_keystore_init(&spa->spa_keystore);
+
 	/*
 	 * This taskq is used to perform zvol-minor-related tasks
 	 * asynchronously. This has several advantages, including easy
@@ -1241,9 +1253,10 @@ spa_deactivate(spa_t *spa)
 	 * still have errors left in the queues.  Empty them just in case.
 	 */
 	spa_errlog_drain(spa);
-
 	avl_destroy(&spa->spa_errlist_scrub);
 	avl_destroy(&spa->spa_errlist_last);
+
+	spa_keystore_fini(&spa->spa_keystore);
 
 	spa->spa_state = POOL_STATE_UNINITIALIZED;
 
@@ -1332,6 +1345,16 @@ spa_unload(spa_t *spa)
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
 	/*
+	 * Stop manual trim before stopping spa sync, because manual trim
+	 * needs to execute a synctask (trim timestamp sync) at the end.
+	 */
+	mutex_enter(&spa->spa_auto_trim_lock);
+	mutex_enter(&spa->spa_man_trim_lock);
+	spa_trim_stop_wait(spa);
+	mutex_exit(&spa->spa_man_trim_lock);
+	mutex_exit(&spa->spa_auto_trim_lock);
+
+	/*
 	 * Stop async tasks.
 	 */
 	spa_async_suspend(spa);
@@ -1343,6 +1366,23 @@ spa_unload(spa_t *spa)
 		txg_sync_stop(spa->spa_dsl_pool);
 		spa->spa_sync_on = B_FALSE;
 	}
+
+	/*
+	 * Stop autotrim tasks.
+	 */
+	mutex_enter(&spa->spa_auto_trim_lock);
+	if (spa->spa_auto_trim_taskq)
+		spa_auto_trim_taskq_destroy(spa);
+	mutex_exit(&spa->spa_auto_trim_lock);
+
+	/*
+	 * Destroy manual trim taskq if needed, this may be required if the
+	 * async task was unable to run prior to being suspended.
+	 */
+	mutex_enter(&spa->spa_man_trim_lock);
+	if (spa->spa_man_trim_taskq)
+		spa_man_trim_taskq_destroy(spa);
+	mutex_exit(&spa->spa_man_trim_lock);
 
 	/*
 	 * Even though vdev_free() also calls vdev_metaslab_fini, we need
@@ -2089,8 +2129,8 @@ spa_load_verify(spa_t *spa)
 
 	if (spa_load_verify_metadata) {
 		error = traverse_pool(spa, spa->spa_verify_min_txg,
-		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
-		    spa_load_verify_cb, rio);
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+		    TRAVERSE_NO_DECRYPT, spa_load_verify_cb, rio);
 	}
 
 	(void) zio_wait(rio);
@@ -2296,7 +2336,7 @@ spa_load(spa_t *spa, spa_load_state_t state, spa_import_type_t type,
 			spa->spa_loaded_ts.tv_nsec = 0;
 		}
 		if (error != EBADF) {
-			zfs_ereport_post(ereport, spa, NULL, NULL, 0, 0);
+			zfs_ereport_post(ereport, spa, NULL, NULL, NULL, 0, 0);
 		}
 	}
 	spa->spa_load_state = error ? SPA_LOAD_ERROR : SPA_LOAD_NONE;
@@ -3071,9 +3111,21 @@ spa_load_impl(spa_t *spa, uint64_t pool_guid, nvlist_t *config,
 		spa_prop_find(spa, ZPOOL_PROP_MULTIHOST, &spa->spa_multihost);
 		spa_prop_find(spa, ZPOOL_PROP_DEDUPDITTO,
 		    &spa->spa_dedup_ditto);
+		spa_prop_find(spa, ZPOOL_PROP_FORCETRIM, &spa->spa_force_trim);
+
+		mutex_enter(&spa->spa_auto_trim_lock);
+		spa_prop_find(spa, ZPOOL_PROP_AUTOTRIM, &spa->spa_auto_trim);
+		if (spa->spa_auto_trim == SPA_AUTO_TRIM_ON)
+			spa_auto_trim_taskq_create(spa);
+		mutex_exit(&spa->spa_auto_trim_lock);
 
 		spa->spa_autoreplace = (autoreplace != 0);
 	}
+
+	(void) spa_dir_prop(spa, DMU_POOL_TRIM_START_TIME,
+	    &spa->spa_man_trim_start_time);
+	(void) spa_dir_prop(spa, DMU_POOL_TRIM_STOP_TIME,
+	    &spa->spa_man_trim_stop_time);
 
 	/*
 	 * If the 'multihost' property is set, then never allow a pool to
@@ -3415,7 +3467,7 @@ spa_open_common(const char *pool, spa_t **spapp, void *tag, nvlist_t *nvpolicy,
 	 * up calling spa_open() again.  The real fix is to figure out how to
 	 * avoid dsl_dir_open() calling this in the first place.
 	 */
-	if (mutex_owner(&spa_namespace_lock) != curthread) {
+	if (MUTEX_NOT_HELD(&spa_namespace_lock)) {
 		mutex_enter(&spa_namespace_lock);
 		locked = B_TRUE;
 	}
@@ -3974,11 +4026,27 @@ spa_l2cache_drop(spa_t *spa)
 }
 
 /*
+ * Verify encryption parameters for spa creation. If we are encrypting, we must
+ * have the encryption feature flag enabled.
+ */
+static int
+spa_create_check_encryption_params(dsl_crypto_params_t *dcp,
+    boolean_t has_encryption)
+{
+	if (dcp->cp_crypt != ZIO_CRYPT_OFF &&
+	    dcp->cp_crypt != ZIO_CRYPT_INHERIT &&
+	    !has_encryption)
+		return (SET_ERROR(ENOTSUP));
+
+	return (dmu_objset_create_crypt_check(NULL, dcp));
+}
+
+/*
  * Pool Creation
  */
 int
 spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
-    nvlist_t *zplprops)
+    nvlist_t *zplprops, dsl_crypto_params_t *dcp)
 {
 	spa_t *spa;
 	char *altroot = NULL;
@@ -3989,8 +4057,11 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	uint64_t txg = TXG_INITIAL;
 	nvlist_t **spares, **l2cache;
 	uint_t nspares, nl2cache;
-	uint64_t version, obj;
+	uint64_t version, obj, root_dsobj = 0;
 	boolean_t has_features;
+	boolean_t has_encryption;
+	spa_feature_t feat;
+	char *feat_name;
 	nvpair_t *elem;
 	int c, i;
 	char *poolname;
@@ -4033,10 +4104,28 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 		spa->spa_import_flags |= ZFS_IMPORT_TEMP_NAME;
 
 	has_features = B_FALSE;
+	has_encryption = B_FALSE;
 	for (elem = nvlist_next_nvpair(props, NULL);
 	    elem != NULL; elem = nvlist_next_nvpair(props, elem)) {
-		if (zpool_prop_feature(nvpair_name(elem)))
+		if (zpool_prop_feature(nvpair_name(elem))) {
 			has_features = B_TRUE;
+
+			feat_name = strchr(nvpair_name(elem), '@') + 1;
+			VERIFY0(zfeature_lookup_name(feat_name, &feat));
+			if (feat == SPA_FEATURE_ENCRYPTION)
+				has_encryption = B_TRUE;
+		}
+	}
+
+	/* verify encryption params, if they were provided */
+	if (dcp != NULL) {
+		error = spa_create_check_encryption_params(dcp, has_encryption);
+		if (error != 0) {
+			spa_deactivate(spa);
+			spa_remove(spa);
+			mutex_exit(&spa_namespace_lock);
+			return (error);
+		}
 	}
 
 	if (has_features || nvlist_lookup_uint64(props,
@@ -4126,8 +4215,7 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	}
 
 	spa->spa_is_initializing = B_TRUE;
-	spa->spa_dsl_pool = dp = dsl_pool_create(spa, zplprops, txg);
-	spa->spa_meta_objset = dp->dp_meta_objset;
+	spa->spa_dsl_pool = dp = dsl_pool_create(spa, zplprops, dcp, txg);
 	spa->spa_is_initializing = B_FALSE;
 
 	/*
@@ -4151,9 +4239,6 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	    sizeof (uint64_t), 1, &spa->spa_config_object, tx) != 0) {
 		cmn_err(CE_PANIC, "failed to add pool config");
 	}
-
-	if (spa_version(spa) >= SPA_VERSION_FEATURES)
-		spa_feature_create_zap_objects(spa, tx);
 
 	if (zap_add(spa->spa_meta_objset,
 	    DMU_POOL_DIRECTORY_OBJECT, DMU_POOL_CREATION_VERSION,
@@ -4207,6 +4292,13 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	spa->spa_failmode = zpool_prop_default_numeric(ZPOOL_PROP_FAILUREMODE);
 	spa->spa_autoexpand = zpool_prop_default_numeric(ZPOOL_PROP_AUTOEXPAND);
 	spa->spa_multihost = zpool_prop_default_numeric(ZPOOL_PROP_MULTIHOST);
+	spa->spa_force_trim = zpool_prop_default_numeric(ZPOOL_PROP_FORCETRIM);
+
+	mutex_enter(&spa->spa_auto_trim_lock);
+	spa->spa_auto_trim = zpool_prop_default_numeric(ZPOOL_PROP_AUTOTRIM);
+	if (spa->spa_auto_trim == SPA_AUTO_TRIM_ON)
+		spa_auto_trim_taskq_create(spa);
+	mutex_exit(&spa->spa_auto_trim_lock);
 
 	if (props != NULL) {
 		spa_configfile_set(spa, props, B_FALSE);
@@ -4215,15 +4307,26 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 
 	dmu_tx_commit(tx);
 
-	spa->spa_sync_on = B_TRUE;
-	txg_sync_start(spa->spa_dsl_pool);
-	mmp_thread_start(spa);
-
 	/*
-	 * We explicitly wait for the first transaction to complete so that our
-	 * bean counters are appropriately updated.
+	 * If the root dataset is encrypted we will need to create key mappings
+	 * for the zio layer before we start to write any data to disk and hold
+	 * them until after the first txg has been synced. Waiting for the first
+	 * transaction to complete also ensures that our bean counters are
+	 * appropriately updated.
 	 */
-	txg_wait_synced(spa->spa_dsl_pool, txg);
+	if (dp->dp_root_dir->dd_crypto_obj != 0) {
+		root_dsobj = dsl_dir_phys(dp->dp_root_dir)->dd_head_dataset_obj;
+		VERIFY0(spa_keystore_create_mapping_impl(spa, root_dsobj,
+		    dp->dp_root_dir, FTAG));
+	}
+
+	spa->spa_sync_on = B_TRUE;
+	txg_sync_start(dp);
+	mmp_thread_start(spa);
+	txg_wait_synced(dp, txg);
+
+	if (dp->dp_root_dir->dd_crypto_obj != 0)
+		VERIFY0(spa_keystore_remove_mapping(spa, root_dsobj, FTAG));
 
 	spa_config_sync(spa, B_FALSE, B_TRUE);
 	spa_event_notify(spa, NULL, NULL, ESC_ZFS_POOL_CREATE);
@@ -4894,6 +4997,8 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	if (newvd->vdev_ashift > oldvd->vdev_top->vdev_ashift)
 		return (spa_vdev_exit(spa, newrootvd, txg, EDOM));
 
+	vdev_trim_stop_wait(oldvd->vdev_top);
+
 	/*
 	 * If this is an in-place replacement, update oldvd's path and devid
 	 * to make it distinguishable from newvd, and unopenable from now on.
@@ -5067,6 +5172,8 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	 */
 	if (vdev_dtl_required(vd))
 		return (spa_vdev_exit(spa, NULL, txg, EBUSY));
+
+	vdev_trim_stop_wait(vd->vdev_top);
 
 	ASSERT(pvd->vdev_children >= 2);
 
@@ -5303,6 +5410,8 @@ spa_vdev_split_mirror(spa_t *spa, char *newname, nvlist_t *config,
 	if (nvlist_lookup_nvlist(nvl, ZPOOL_CONFIG_SPARES, &tmp) == 0 ||
 	    nvlist_lookup_nvlist(nvl, ZPOOL_CONFIG_L2CACHE, &tmp) == 0)
 		return (spa_vdev_exit(spa, NULL, txg, EINVAL));
+
+	vdev_trim_stop_wait(rvd);
 
 	vml = kmem_zalloc(children * sizeof (vdev_t *), KM_SLEEP);
 	glist = kmem_zalloc(children * sizeof (uint64_t), KM_SLEEP);
@@ -5736,6 +5845,8 @@ spa_vdev_remove(spa_t *spa, uint64_t guid, boolean_t unspare)
 		 */
 		metaslab_group_passivate(mg);
 
+		vdev_trim_stop_wait(vd);
+
 		/*
 		 * Wait for the youngest allocations and frees to sync,
 		 * and then wait for the deferral of those frees to finish.
@@ -6068,8 +6179,9 @@ spa_async_autoexpand(spa_t *spa, vdev_t *vd)
 }
 
 static void
-spa_async_thread(spa_t *spa)
+spa_async_thread(void *arg)
 {
+	spa_t *spa = (spa_t *)arg;
 	int tasks, i;
 
 	ASSERT(spa->spa_sync_on);
@@ -6142,6 +6254,12 @@ spa_async_thread(spa_t *spa)
 	if (tasks & SPA_ASYNC_RESILVER)
 		dsl_resilver_restart(spa->spa_dsl_pool, 0);
 
+	if (tasks & SPA_ASYNC_MAN_TRIM_TASKQ_DESTROY) {
+		mutex_enter(&spa->spa_man_trim_lock);
+		spa_man_trim_taskq_destroy(spa);
+		mutex_exit(&spa->spa_man_trim_lock);
+	}
+
 	/*
 	 * Let the world know that we're done.
 	 */
@@ -6210,6 +6328,15 @@ spa_async_request(spa_t *spa, int task)
 	zfs_dbgmsg("spa=%s async request task=%u", spa->spa_name, task);
 	mutex_enter(&spa->spa_async_lock);
 	spa->spa_async_tasks |= task;
+	mutex_exit(&spa->spa_async_lock);
+}
+
+void
+spa_async_unrequest(spa_t *spa, int task)
+{
+	zfs_dbgmsg("spa=%s async unrequest task=%u", spa->spa_name, task);
+	mutex_enter(&spa->spa_async_lock);
+	spa->spa_async_tasks &= ~task;
 	mutex_exit(&spa->spa_async_lock);
 }
 
@@ -6621,6 +6748,21 @@ spa_sync_props(void *arg, dmu_tx_t *tx)
 			case ZPOOL_PROP_FAILUREMODE:
 				spa->spa_failmode = intval;
 				break;
+			case ZPOOL_PROP_FORCETRIM:
+				spa->spa_force_trim = intval;
+				break;
+			case ZPOOL_PROP_AUTOTRIM:
+				mutex_enter(&spa->spa_auto_trim_lock);
+				if (intval != spa->spa_auto_trim) {
+					spa->spa_auto_trim = intval;
+					if (intval != 0)
+						spa_auto_trim_taskq_create(spa);
+					else
+						spa_auto_trim_taskq_destroy(
+						    spa);
+				}
+				mutex_exit(&spa->spa_auto_trim_lock);
+				break;
 			case ZPOOL_PROP_AUTOEXPAND:
 				spa->spa_autoexpand = intval;
 				if (tx->tx_txg != TXG_INITIAL)
@@ -6750,6 +6892,9 @@ spa_sync(spa_t *spa, uint64_t txg)
 	mutex_enter(&spa->spa_alloc_lock);
 	VERIFY0(avl_numnodes(&spa->spa_alloc_tree));
 	mutex_exit(&spa->spa_alloc_lock);
+
+	if (spa->spa_auto_trim == SPA_AUTO_TRIM_ON)
+		spa_auto_trim(spa, txg);
 
 	/*
 	 * If there are any pending vdev state changes, convert them
@@ -7218,6 +7363,274 @@ void
 spa_event_notify(spa_t *spa, vdev_t *vd, nvlist_t *hist_nvl, const char *name)
 {
 	spa_event_post(spa_event_create(spa, vd, hist_nvl, name));
+}
+
+
+/*
+ * Dispatches all auto-trim processing to all top-level vdevs. This is
+ * called from spa_sync once every txg.
+ */
+static void
+spa_auto_trim(spa_t *spa, uint64_t txg)
+{
+	ASSERT(spa_config_held(spa, SCL_CONFIG, RW_READER) == SCL_CONFIG);
+	ASSERT(!MUTEX_HELD(&spa->spa_auto_trim_lock));
+	ASSERT(spa->spa_auto_trim_taskq != NULL);
+
+	/*
+	 * Another pool management task might be currently prevented from
+	 * starting and the current txg sync was invoked on its behalf,
+	 * so be prepared to postpone autotrim processing.
+	 */
+	if (!mutex_tryenter(&spa->spa_auto_trim_lock))
+		return;
+	spa->spa_num_auto_trimming += spa->spa_root_vdev->vdev_children;
+	mutex_exit(&spa->spa_auto_trim_lock);
+
+	for (uint64_t i = 0; i < spa->spa_root_vdev->vdev_children; i++) {
+		vdev_trim_info_t *vti = kmem_zalloc(sizeof (*vti), KM_SLEEP);
+		vti->vti_vdev = spa->spa_root_vdev->vdev_child[i];
+		vti->vti_txg = txg;
+		vti->vti_done_cb = (void (*)(void *))spa_vdev_auto_trim_done;
+		vti->vti_done_arg = spa;
+		(void) taskq_dispatch(spa->spa_auto_trim_taskq,
+		    (void (*)(void *))vdev_auto_trim, vti, TQ_SLEEP);
+	}
+}
+
+/*
+ * Performs the sync update of the MOS pool directory's trim start/stop values.
+ */
+static void
+spa_trim_update_time_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_t *spa = arg;
+	VERIFY0(zap_update(spa->spa_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_TRIM_START_TIME, sizeof (uint64_t), 1,
+	    &spa->spa_man_trim_start_time, tx));
+	VERIFY0(zap_update(spa->spa_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_TRIM_STOP_TIME, sizeof (uint64_t), 1,
+	    &spa->spa_man_trim_stop_time, tx));
+}
+
+/*
+ * Updates the in-core and on-disk manual TRIM operation start/stop time.
+ * Passing UINT64_MAX for either start_time or stop_time means that no
+ * update to that value should be recorded.
+ */
+static void
+spa_trim_update_time(spa_t *spa, uint64_t start_time, uint64_t stop_time)
+{
+	int err;
+	dmu_tx_t *tx;
+
+	ASSERT(MUTEX_HELD(&spa->spa_man_trim_lock));
+	if (start_time != UINT64_MAX)
+		spa->spa_man_trim_start_time = start_time;
+	if (stop_time != UINT64_MAX)
+		spa->spa_man_trim_stop_time = stop_time;
+	tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
+	err = dmu_tx_assign(tx, TXG_WAIT);
+	if (err) {
+		dmu_tx_abort(tx);
+		return;
+	}
+	dsl_sync_task_nowait(spa_get_dsl(spa), spa_trim_update_time_sync,
+	    spa, 1, ZFS_SPACE_CHECK_RESERVED, tx);
+	dmu_tx_commit(tx);
+}
+
+/*
+ * Initiates an manual TRIM of the whole pool. This kicks off individual
+ * TRIM tasks for each top-level vdev, which then pass over all of the free
+ * space in all of the vdev's metaslabs and issues TRIM commands for that
+ * space to the underlying vdevs.
+ */
+extern void
+spa_man_trim(spa_t *spa, uint64_t rate, boolean_t fulltrim)
+{
+	void (*trimfunc)(void *);
+
+	mutex_enter(&spa->spa_man_trim_lock);
+	if (fulltrim)
+		trimfunc = (void (*)(void *))vdev_man_trim_full;
+	else
+		trimfunc = (void (*)(void *))vdev_man_trim;
+
+	if (rate != 0)
+		spa->spa_man_trim_rate = MAX(rate, spa_min_trim_rate(spa));
+	else
+		spa->spa_man_trim_rate = 0;
+
+	if (spa->spa_num_man_trimming) {
+		/*
+		 * TRIM is already ongoing. Wake up all sleeping vdev trim
+		 * threads because the trim rate might have changed above.
+		 */
+		cv_broadcast(&spa->spa_man_trim_update_cv);
+		mutex_exit(&spa->spa_man_trim_lock);
+		return;
+	}
+	spa_man_trim_taskq_create(spa);
+	spa->spa_man_trim_stop = B_FALSE;
+
+	spa_event_notify(spa, NULL, NULL, ESC_ZFS_TRIM_START);
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	for (uint64_t i = 0; i < spa->spa_root_vdev->vdev_children; i++) {
+		vdev_t *vd = spa->spa_root_vdev->vdev_child[i];
+		vdev_trim_info_t *vti = kmem_zalloc(sizeof (*vti), KM_SLEEP);
+		vti->vti_vdev = vd;
+		vti->vti_done_cb = (void (*)(void *))spa_vdev_man_trim_done;
+		vti->vti_done_arg = spa;
+		spa->spa_num_man_trimming++;
+
+		vd->vdev_trim_prog = 0;
+		(void) taskq_dispatch(spa->spa_man_trim_taskq,
+		    trimfunc, vti, TQ_SLEEP);
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	spa_trim_update_time(spa, gethrestime_sec(), 0);
+	mutex_exit(&spa->spa_man_trim_lock);
+}
+
+/*
+ * Orders a manual TRIM operation to stop and returns immediately.
+ */
+extern void
+spa_man_trim_stop(spa_t *spa)
+{
+	boolean_t held = MUTEX_HELD(&spa->spa_man_trim_lock);
+	if (!held)
+		mutex_enter(&spa->spa_man_trim_lock);
+	spa->spa_man_trim_stop = B_TRUE;
+	cv_broadcast(&spa->spa_man_trim_update_cv);
+	if (!held)
+		mutex_exit(&spa->spa_man_trim_lock);
+}
+
+/*
+ * Orders a manual TRIM operation to stop and waits for both manual and
+ * automatic TRIM to complete. By holding both the spa_man_trim_lock and
+ * the spa_auto_trim_lock, the caller can guarantee that after this
+ * function returns, no new TRIM operations can be initiated in parallel.
+ */
+void
+spa_trim_stop_wait(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&spa->spa_man_trim_lock));
+	ASSERT(MUTEX_HELD(&spa->spa_auto_trim_lock));
+	spa->spa_man_trim_stop = B_TRUE;
+	cv_broadcast(&spa->spa_man_trim_update_cv);
+	while (spa->spa_num_man_trimming > 0)
+		cv_wait(&spa->spa_man_trim_done_cv, &spa->spa_man_trim_lock);
+	while (spa->spa_num_auto_trimming > 0)
+		cv_wait(&spa->spa_auto_trim_done_cv, &spa->spa_auto_trim_lock);
+}
+
+/*
+ * Returns manual TRIM progress. Progress is indicated by four return values:
+ * 1) prog: the number of bytes of space on the pool in total that manual
+ *	TRIM has already passed (regardless if the space is allocated or not).
+ *	Completion of the operation is indicated when either the returned value
+ *	is zero, or when the returned value is equal to the sum of the sizes of
+ *	all top-level vdevs.
+ * 2) rate: the trim rate in bytes per second. A value of zero indicates that
+ *	trim progresses as fast as possible.
+ * 3) start_time: the UNIXTIME of when the last manual TRIM operation was
+ *	started. If no manual trim was ever initiated on the pool, this is
+ *	zero.
+ * 4) stop_time: the UNIXTIME of when the last manual TRIM operation has
+ *	stopped on the pool. If a trim was started (start_time != 0), but has
+ *	not yet completed, stop_time will be zero. If a trim is NOT currently
+ *	ongoing and start_time is non-zero, this indicates that the previously
+ *	initiated TRIM operation was interrupted.
+ */
+extern void
+spa_get_trim_prog(spa_t *spa, uint64_t *prog, uint64_t *rate,
+    uint64_t *start_time, uint64_t *stop_time)
+{
+	uint64_t total = 0;
+	vdev_t *root_vd = spa->spa_root_vdev;
+
+	ASSERT(spa_config_held(spa, SCL_CONFIG, RW_READER));
+	mutex_enter(&spa->spa_man_trim_lock);
+	if (spa->spa_num_man_trimming > 0) {
+		for (uint64_t i = 0; i < root_vd->vdev_children; i++) {
+			total += root_vd->vdev_child[i]->vdev_trim_prog;
+		}
+	}
+	*prog = total;
+	*rate = spa->spa_man_trim_rate;
+	*start_time = spa->spa_man_trim_start_time;
+	*stop_time = spa->spa_man_trim_stop_time;
+	mutex_exit(&spa->spa_man_trim_lock);
+}
+
+/*
+ * Callback when a vdev_man_trim has finished on a single top-level vdev.
+ */
+static void
+spa_vdev_man_trim_done(spa_t *spa)
+{
+	mutex_enter(&spa->spa_man_trim_lock);
+	ASSERT(spa->spa_num_man_trimming > 0);
+	spa->spa_num_man_trimming--;
+	if (spa->spa_num_man_trimming == 0) {
+		/* if we were interrupted, leave stop_time at zero */
+		if (!spa->spa_man_trim_stop) {
+			spa_trim_update_time(spa, UINT64_MAX,
+			    gethrestime_sec());
+		}
+		spa_event_notify(spa, NULL, NULL, ESC_ZFS_TRIM_FINISH);
+		spa_async_request(spa, SPA_ASYNC_MAN_TRIM_TASKQ_DESTROY);
+		cv_broadcast(&spa->spa_man_trim_done_cv);
+	}
+	mutex_exit(&spa->spa_man_trim_lock);
+}
+
+/*
+ * Called from vdev_auto_trim when a vdev has completed its auto-trim
+ * processing.
+ */
+static void
+spa_vdev_auto_trim_done(spa_t *spa)
+{
+	mutex_enter(&spa->spa_auto_trim_lock);
+	VERIFY(spa->spa_num_auto_trimming > 0);
+	spa->spa_num_auto_trimming--;
+	if (spa->spa_num_auto_trimming == 0)
+		cv_broadcast(&spa->spa_auto_trim_done_cv);
+	mutex_exit(&spa->spa_auto_trim_lock);
+}
+
+/*
+ * Determines the minimum sensible rate at which a manual TRIM can be
+ * performed on a given spa and returns it (in bytes per second). The
+ * value is calculated by assuming that TRIMming a metaslab should take
+ * no more than 1000s. The exact value here is not important, we just want
+ * to make sure that the calculated delay values in vdev_man_trim aren't
+ * too large (which might cause integer precision issues). Thus, on a
+ * typical 200-metaslab vdev, the longest TRIM should take is about 55
+ * hours. It *can* take longer if the device is really slow respond to
+ * zio_trim() commands or it contains more than 200 metaslabs, or metaslab
+ * sizes vary widely between top-level vdevs.
+ */
+static uint64_t
+spa_min_trim_rate(spa_t *spa)
+{
+	uint64_t i, smallest_ms_sz = UINT64_MAX;
+
+	/* find the smallest metaslab */
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	for (i = 0; i < spa->spa_root_vdev->vdev_children; i++) {
+		smallest_ms_sz = MIN(smallest_ms_sz,
+		    spa->spa_root_vdev->vdev_child[i]->vdev_ms[0]->ms_size);
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	VERIFY(smallest_ms_sz != 0);
+
+	/* minimum TRIM rate is 1/1000th of the smallest metaslab size */
+	return (smallest_ms_sz / 1000);
 }
 
 #if defined(_KERNEL) && defined(HAVE_SPL)

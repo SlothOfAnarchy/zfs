@@ -21,7 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2011, 2017 by Delphix. All rights reserved.
- * Copyright (c) 2011 Nexenta Systems, Inc. All rights reserved.
+ * Copyright (c) 2017 Nexenta Systems, Inc. All rights reserved.
  */
 
 #include <sys/sysmacros.h>
@@ -43,6 +43,9 @@
 #include <sys/time.h>
 #include <sys/trace_zio.h>
 #include <sys/abd.h>
+#include <sys/dsl_crypt.h>
+#include <sys/dkioc_free_util.h>
+#include <sys/metaslab_impl.h>
 
 /*
  * ==========================================================================
@@ -114,6 +117,15 @@ int zio_buf_debug_limit = 0;
 static inline void __zio_execute(zio_t *zio);
 
 static void zio_taskq_dispatch(zio_t *, zio_taskq_type_t, boolean_t);
+
+/*
+ * Tunable to allow for debugging SCSI UNMAP/SATA TRIM calls. Disabling
+ * it will prevent ZFS from attempting to issue DKIOCFREE ioctls to the
+ * underlying storage.
+ */
+int zfs_trim = B_TRUE;
+int zfs_trim_min_ext_sz = 128 << 10;	/* 128k */
+int zfs_trim_sync = B_TRUE;
 
 void
 zio_init(void)
@@ -368,7 +380,7 @@ zio_pop_transforms(zio_t *zio)
 
 /*
  * ==========================================================================
- * I/O transform callbacks for subblocks and decompression
+ * I/O transform callbacks for subblocks, decompression, and decryption
  * ==========================================================================
  */
 static void
@@ -391,6 +403,126 @@ zio_decompress(zio_t *zio, abd_t *data, uint64_t size)
 
 		if (ret != 0)
 			zio->io_error = SET_ERROR(EIO);
+	}
+}
+
+static void
+zio_decrypt(zio_t *zio, abd_t *data, uint64_t size)
+{
+	int ret;
+	void *tmp;
+	blkptr_t *bp = zio->io_bp;
+	uint64_t lsize = BP_GET_LSIZE(bp);
+	dmu_object_type_t ot = BP_GET_TYPE(bp);
+	uint8_t salt[ZIO_DATA_SALT_LEN];
+	uint8_t iv[ZIO_DATA_IV_LEN];
+	uint8_t mac[ZIO_DATA_MAC_LEN];
+	boolean_t no_crypt = B_FALSE;
+
+	ASSERT(BP_USES_CRYPT(bp));
+	ASSERT3U(size, !=, 0);
+
+	if (zio->io_error != 0)
+		return;
+
+	/*
+	 * Verify the cksum of MACs stored in an indirect bp. It will always
+	 * be possible to verify this since it does not require an encryption
+	 * key.
+	 */
+	if (BP_HAS_INDIRECT_MAC_CKSUM(bp)) {
+		zio_crypt_decode_mac_bp(bp, mac);
+
+		if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_OFF) {
+			/*
+			 * We haven't decompressed the data yet, but
+			 * zio_crypt_do_indirect_mac_checksum() requires
+			 * decompressed data to be able to parse out the MACs
+			 * from the indirect block. We decompress it now and
+			 * throw away the result after we are finished.
+			 */
+			tmp = zio_buf_alloc(lsize);
+			ret = zio_decompress_data(BP_GET_COMPRESS(bp),
+			    zio->io_abd, tmp, zio->io_size, lsize);
+			if (ret != 0) {
+				ret = SET_ERROR(EIO);
+				goto error;
+			}
+			ret = zio_crypt_do_indirect_mac_checksum(B_FALSE,
+			    tmp, lsize, BP_SHOULD_BYTESWAP(bp), mac);
+			zio_buf_free(tmp, lsize);
+		} else {
+			ret = zio_crypt_do_indirect_mac_checksum_abd(B_FALSE,
+			    zio->io_abd, size, BP_SHOULD_BYTESWAP(bp), mac);
+		}
+		abd_copy(data, zio->io_abd, size);
+
+		if (ret != 0)
+			goto error;
+
+		return;
+	}
+
+	/*
+	 * If this is an authenticated block, just check the MAC. It would be
+	 * nice to separate this out into its own flag, but for the moment
+	 * enum zio_flag is out of bits.
+	 */
+	if (BP_IS_AUTHENTICATED(bp)) {
+		if (ot == DMU_OT_OBJSET) {
+			ret = spa_do_crypt_objset_mac_abd(B_FALSE, zio->io_spa,
+			    zio->io_bookmark.zb_objset, zio->io_abd, size,
+			    BP_SHOULD_BYTESWAP(bp));
+		} else {
+			zio_crypt_decode_mac_bp(bp, mac);
+			ret = spa_do_crypt_mac_abd(B_FALSE, zio->io_spa,
+			    zio->io_bookmark.zb_objset, zio->io_abd, size, mac);
+		}
+		abd_copy(data, zio->io_abd, size);
+
+		if (ret != 0)
+			goto error;
+
+		return;
+	}
+
+	zio_crypt_decode_params_bp(bp, salt, iv);
+
+	if (ot == DMU_OT_INTENT_LOG) {
+		tmp = abd_borrow_buf_copy(zio->io_abd, sizeof (zil_chain_t));
+		zio_crypt_decode_mac_zil(tmp, mac);
+		abd_return_buf(zio->io_abd, tmp, sizeof (zil_chain_t));
+	} else {
+		zio_crypt_decode_mac_bp(bp, mac);
+	}
+
+	ret = spa_do_crypt_abd(B_FALSE, zio->io_spa, zio->io_bookmark.zb_objset,
+	    bp, bp->blk_birth, size, data, zio->io_abd, iv, mac, salt,
+	    &no_crypt);
+	if (no_crypt)
+		abd_copy(data, zio->io_abd, size);
+
+	if (ret != 0)
+		goto error;
+
+	return;
+
+error:
+	/* assert that the key was found unless this was speculative */
+	ASSERT(ret != ENOENT || (zio->io_flags & ZIO_FLAG_SPECULATIVE));
+
+	/*
+	 * If there was a decryption / authentication error return EIO as
+	 * the io_error. If this was not a speculative zio, create an ereport.
+	 */
+	if (ret == ECKSUM) {
+		ret = SET_ERROR(EIO);
+		if ((zio->io_flags & ZIO_FLAG_SPECULATIVE) == 0) {
+			zfs_ereport_post(FM_EREPORT_ZFS_AUTHENTICATION,
+			    zio->io_spa, NULL, &zio->io_bookmark, zio, 0, 0);
+		}
+	} else {
+		zio->io_error = ret;
 	}
 }
 
@@ -606,7 +738,7 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	ASSERT(!bp || !(flags & ZIO_FLAG_CONFIG_WRITER));
 	ASSERT(vd || stage == ZIO_STAGE_OPEN);
 
-	IMPLY(lsize != psize, (flags & ZIO_FLAG_RAW) != 0);
+	IMPLY(lsize != psize, (flags & ZIO_FLAG_RAW_COMPRESS) != 0);
 
 	zio = kmem_cache_alloc(zio_cache, KM_SLEEP);
 	bzero(zio, sizeof (zio_t));
@@ -680,11 +812,27 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 static void
 zio_destroy(zio_t *zio)
 {
+	if (ZIO_IS_TRIM(zio)) {
+		vdev_t *vd = zio->io_vd;
+		ASSERT(vd != NULL);
+		ASSERT(!MUTEX_HELD(&vd->vdev_trim_zios_lock));
+		mutex_enter(&vd->vdev_trim_zios_lock);
+		ASSERT(vd->vdev_trim_zios != 0);
+		vd->vdev_trim_zios--;
+		cv_broadcast(&vd->vdev_trim_zios_cv);
+		mutex_exit(&vd->vdev_trim_zios_lock);
+	}
 	metaslab_trace_fini(&zio->io_alloc_list);
 	list_destroy(&zio->io_parent_list);
 	list_destroy(&zio->io_child_list);
 	mutex_destroy(&zio->io_lock);
 	cv_destroy(&zio->io_cv);
+	if (zio->io_dfl_stats != NULL)
+		kmem_free(zio->io_dfl_stats, sizeof (vdev_stat_trim_t));
+	if (zio->io_dfl != NULL && zio->io_dfl_free_on_destroy)
+		dfl_free(zio->io_dfl);
+	else
+		ASSERT0(zio->io_dfl_free_on_destroy);
 	kmem_cache_free(zio_cache, zio);
 }
 
@@ -844,9 +992,12 @@ zio_write(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
 	 * Data can be NULL if we are going to call zio_write_override() to
 	 * provide the already-allocated BP.  But we may need the data to
 	 * verify a dedup hit (if requested).  In this case, don't try to
-	 * dedup (just take the already-allocated BP verbatim).
+	 * dedup (just take the already-allocated BP verbatim). Encrypted
+	 * dedup blocks need data as well so we also disable dedup in this
+	 * case.
 	 */
-	if (data == NULL && zio->io_prop.zp_dedup_verify) {
+	if (data == NULL &&
+	    (zio->io_prop.zp_dedup_verify || zio->io_prop.zp_encrypt)) {
 		zio->io_prop.zp_dedup = zio->io_prop.zp_dedup_verify = B_FALSE;
 	}
 
@@ -1003,6 +1154,180 @@ zio_ioctl(zio_t *pio, spa_t *spa, vdev_t *vd, int cmd,
 	}
 
 	return (zio);
+}
+
+/*
+ * Performs the same function as zio_trim_tree, but takes a dkioc_free_list_t
+ * instead of a range tree of extents. The `dfl' argument is stored in the
+ * zio and shouldn't be altered by the caller after calling zio_trim_dfl.
+ * If `dfl_free_on_destroy' is true, the zio will destroy and free the list
+ * using dfl_free after the zio is done executing.
+ */
+zio_t *
+zio_trim_dfl(zio_t *pio, spa_t *spa, vdev_t *vd, dkioc_free_list_t *dfl,
+    boolean_t dfl_free_on_destroy, boolean_t auto_trim,
+    zio_done_func_t *done, void *private)
+{
+	zio_t *zio;
+	int c;
+
+	ASSERT(dfl->dfl_num_exts != 0);
+
+	if (!vdev_writeable(vd)) {
+		/* Skip unavailable vdevs, just create a dummy zio. */
+		zio = zio_null(pio, spa, vd, done, private, 0);
+		zio->io_dfl = dfl;
+		zio->io_dfl_free_on_destroy = dfl_free_on_destroy;
+	} else if (vd->vdev_ops->vdev_op_leaf) {
+		/*
+		 * A trim zio is a special ioctl zio that can enter the vdev
+		 * queue. We don't want to be sorted in the queue by offset,
+		 * but sometimes the queue requires that, so we fake an
+		 * offset value. We simply use the offset of the first extent
+		 * and the minimum allocation unit on the vdev to keep the
+		 * queue's algorithms working more-or-less as they should.
+		 */
+		uint64_t off = dfl->dfl_exts[0].dfle_start;
+		uint64_t size = 1 << vd->vdev_top->vdev_ashift;
+
+		zio = zio_create(pio, spa, 0, NULL, NULL,
+		    size, size, done, private, ZIO_TYPE_IOCTL,
+		    auto_trim ? ZIO_PRIORITY_AUTO_TRIM : ZIO_PRIORITY_MAN_TRIM,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY |
+		    ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_DONT_AGGREGATE, vd, off,
+		    NULL, ZIO_STAGE_OPEN, ZIO_TRIM_PIPELINE);
+		zio->io_cmd = DKIOCFREE;
+		zio->io_dfl = dfl;
+		zio->io_dfl_free_on_destroy = dfl_free_on_destroy;
+
+		mutex_enter(&vd->vdev_trim_zios_lock);
+		vd->vdev_trim_zios++;
+		mutex_exit(&vd->vdev_trim_zios_lock);
+	} else {
+		/*
+		 * Trims to non-leaf vdevs have two possible paths. For vdevs
+		 * that do not provide a specific trim fanout handler, we
+		 * simply duplicate the trim to each child. vdevs which do
+		 * have a trim fanout handler are responsible for doing the
+		 * fanout themselves.
+		 */
+		zio = zio_null(pio, spa, vd, done, private, 0);
+		zio->io_dfl = dfl;
+		zio->io_dfl_free_on_destroy = dfl_free_on_destroy;
+
+		if (vd->vdev_ops->vdev_op_trim != NULL) {
+			vd->vdev_ops->vdev_op_trim(vd, zio, dfl, auto_trim);
+		} else {
+			for (c = 0; c < vd->vdev_children; c++) {
+				zio_nowait(zio_trim_dfl(zio, spa,
+				    vd->vdev_child[c], dfl, B_FALSE, auto_trim,
+				    NULL, NULL));
+			}
+		}
+	}
+
+	return (zio);
+}
+
+/*
+ * This check is used by zio_trim_tree to set in dfl_ck_func to help debugging
+ * extent trimming. If the SCSI driver (sd) was compiled with the DEBUG flag
+ * set, dfl_ck_func is called for every extent to verify that it is indeed
+ * ok to be trimmed. This function compares the extent address with the tree
+ * of free blocks (ms_tree) in the metaslab which this trim was originally
+ * part of.
+ */
+static void
+zio_trim_check(uint64_t start, uint64_t len, void *msp)
+{
+	metaslab_t *ms = msp;
+	boolean_t held = MUTEX_HELD(&ms->ms_lock);
+	if (!held)
+		mutex_enter(&ms->ms_lock);
+	ASSERT(ms->ms_trimming_ts != NULL);
+	if (ms->ms_loaded)
+		ASSERT(range_tree_contains(ms->ms_trimming_ts,
+		    start - VDEV_LABEL_START_SIZE, len));
+	if (!held)
+		mutex_exit(&ms->ms_lock);
+}
+
+/*
+ * Takes a bunch of freed extents and tells the underlying vdevs that the
+ * space associated with these extents can be released.
+ * This is used by flash storage to pre-erase blocks for rapid reuse later
+ * and thin-provisioned block storage to reclaim unused blocks.
+ * This function is actually a front-end to zio_trim_dfl. It simply converts
+ * the provided range_tree's contents into a dkioc_free_list_t and calls
+ * zio_trim_dfl with it. The `tree' argument is not used after this function
+ * returns and can be discarded by the caller.
+ */
+zio_t *
+zio_trim_tree(zio_t *pio, spa_t *spa, vdev_t *vd, struct range_tree *tree,
+    boolean_t auto_trim, zio_done_func_t *done, void *private,
+    int dkiocfree_flags, metaslab_t *msp)
+{
+	dkioc_free_list_t *dfl = NULL;
+	range_seg_t *rs;
+	uint64_t rs_idx;
+	uint64_t num_exts;
+	uint64_t bytes_issued = 0, bytes_skipped = 0, exts_skipped = 0;
+
+	ASSERT(range_tree_space(tree) != 0);
+
+	num_exts = avl_numnodes(&tree->rt_root);
+	dfl = dfl_alloc(num_exts, KM_SLEEP);
+	dfl->dfl_flags = dkiocfree_flags;
+	dfl->dfl_num_exts = num_exts;
+	dfl->dfl_offset = VDEV_LABEL_START_SIZE;
+	if (msp) {
+		dfl->dfl_ck_func = zio_trim_check;
+		dfl->dfl_ck_arg = msp;
+	}
+
+	for (rs = avl_first(&tree->rt_root), rs_idx = 0; rs != NULL;
+	    rs = AVL_NEXT(&tree->rt_root, rs)) {
+		uint64_t len = rs->rs_end - rs->rs_start;
+
+		/* Skip extents that are too short to bother with. */
+		if (len < zfs_trim_min_ext_sz) {
+			bytes_skipped += len;
+			exts_skipped++;
+			continue;
+		}
+
+		dfl->dfl_exts[rs_idx].dfle_start = rs->rs_start;
+		dfl->dfl_exts[rs_idx].dfle_length = len;
+
+		/* check we're a multiple of the vdev ashift */
+		ASSERT0(dfl->dfl_exts[rs_idx].dfle_start &
+		    ((1 << vd->vdev_ashift) - 1));
+		ASSERT0(dfl->dfl_exts[rs_idx].dfle_length &
+		    ((1 << vd->vdev_ashift) - 1));
+
+		rs_idx++;
+		bytes_issued += len;
+	}
+
+	spa_trimstats_update(spa, rs_idx, bytes_issued, exts_skipped,
+	    bytes_skipped);
+
+	/* the zfs_trim_min_ext_sz filter may have shortened the list */
+	if (dfl->dfl_num_exts != rs_idx) {
+		if (rs_idx == 0) {
+			/* Removing short extents has removed all extents. */
+			dfl_free(dfl);
+			return (zio_null(pio, spa, vd, done, private, 0));
+		}
+		dkioc_free_list_t *dfl2 = dfl_alloc(rs_idx, KM_SLEEP);
+		bcopy(dfl, dfl2, DFL_SZ(rs_idx));
+		dfl2->dfl_num_exts = rs_idx;
+		dfl_free(dfl);
+		dfl = dfl2;
+	}
+
+	return (zio_trim_dfl(pio, spa, vd, dfl, B_TRUE, auto_trim, done,
+	    private));
 }
 
 zio_t *
@@ -1186,14 +1511,21 @@ static int
 zio_read_bp_init(zio_t *zio)
 {
 	blkptr_t *bp = zio->io_bp;
+	uint64_t psize =
+	    BP_IS_EMBEDDED(bp) ? BPE_GET_PSIZE(bp) : BP_GET_PSIZE(bp);
 
 	if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_OFF &&
 	    zio->io_child_type == ZIO_CHILD_LOGICAL &&
-	    !(zio->io_flags & ZIO_FLAG_RAW)) {
-		uint64_t psize =
-		    BP_IS_EMBEDDED(bp) ? BPE_GET_PSIZE(bp) : BP_GET_PSIZE(bp);
+	    !(zio->io_flags & ZIO_FLAG_RAW_COMPRESS)) {
 		zio_push_transform(zio, abd_alloc_sametype(zio->io_abd, psize),
 		    psize, psize, zio_decompress);
+	}
+
+	if (((BP_IS_PROTECTED(bp) && !(zio->io_flags & ZIO_FLAG_RAW_ENCRYPT)) ||
+	    BP_HAS_INDIRECT_MAC_CKSUM(bp)) &&
+	    zio->io_child_type == ZIO_CHILD_LOGICAL) {
+		zio_push_transform(zio, abd_alloc_sametype(zio->io_abd, psize),
+		    psize, psize, zio_decrypt);
 	}
 
 	if (BP_IS_EMBEDDED(bp) && BPE_GET_ETYPE(bp) == BP_EMBEDDED_TYPE_DATA) {
@@ -1222,7 +1554,6 @@ zio_read_bp_init(zio_t *zio)
 static int
 zio_write_bp_init(zio_t *zio)
 {
-
 	if (!IO_IS_ALLOCATING(zio))
 		return (ZIO_PIPELINE_CONTINUE);
 
@@ -1261,7 +1592,8 @@ zio_write_bp_init(zio_t *zio)
 		ASSERT((zio_checksum_table[zp->zp_checksum].ci_flags &
 		    ZCHECKSUM_FLAG_DEDUP) || zp->zp_dedup_verify);
 
-		if (BP_GET_CHECKSUM(bp) == zp->zp_checksum) {
+		if (BP_GET_CHECKSUM(bp) == zp->zp_checksum &&
+		    !zp->zp_encrypt) {
 			BP_SET_DEDUP(bp, 1);
 			zio->io_pipeline |= ZIO_STAGE_DDT_WRITE;
 			return (ZIO_PIPELINE_CONTINUE);
@@ -1289,8 +1621,6 @@ zio_write_compress(zio_t *zio)
 	uint64_t lsize = zio->io_lsize;
 	uint64_t psize = zio->io_size;
 	int pass = 1;
-
-	EQUIV(lsize != psize, (zio->io_flags & ZIO_FLAG_RAW) != 0);
 
 	/*
 	 * If our children haven't all reached the ready stage,
@@ -1341,13 +1671,15 @@ zio_write_compress(zio_t *zio)
 	}
 
 	/* If it's a compressed write that is not raw, compress the buffer. */
-	if (compress != ZIO_COMPRESS_OFF && psize == lsize) {
+	if (compress != ZIO_COMPRESS_OFF &&
+	    !(zio->io_flags & ZIO_FLAG_RAW_COMPRESS)) {
 		void *cbuf = zio_buf_alloc(lsize);
 		psize = zio_compress_data(compress, zio->io_abd, cbuf, lsize);
 		if (psize == 0 || psize == lsize) {
 			compress = ZIO_COMPRESS_OFF;
 			zio_buf_free(cbuf, lsize);
-		} else if (!zp->zp_dedup && psize <= BPE_PAYLOAD_SIZE &&
+		} else if (!zp->zp_dedup && !zp->zp_encrypt &&
+		    psize <= BPE_PAYLOAD_SIZE &&
 		    zp->zp_level == 0 && !DMU_OT_HAS_FILL(zp->zp_type) &&
 		    spa_feature_is_enabled(spa, SPA_FEATURE_EMBEDDED_DATA)) {
 			encode_embedded_bp_compressed(bp,
@@ -1445,6 +1777,8 @@ zio_write_compress(zio_t *zio)
 		if (zp->zp_dedup) {
 			ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
 			ASSERT(!(zio->io_flags & ZIO_FLAG_IO_REWRITE));
+			ASSERT(!zp->zp_encrypt ||
+			    DMU_OT_IS_ENCRYPTED(zp->zp_type));
 			zio->io_pipeline = ZIO_DDT_WRITE_PIPELINE;
 		}
 		if (zp->zp_nopwrite) {
@@ -1868,7 +2202,8 @@ zio_suspend(spa_t *spa, zio_t *zio)
 	cmn_err(CE_WARN, "Pool '%s' has encountered an uncorrectable I/O "
 	    "failure and has been suspended.\n", spa_name(spa));
 
-	zfs_ereport_post(FM_EREPORT_ZFS_IO_FAILURE, spa, NULL, NULL, 0, 0);
+	zfs_ereport_post(FM_EREPORT_ZFS_IO_FAILURE, spa, NULL,
+	    NULL, NULL, 0, 0);
 
 	mutex_enter(&spa->spa_suspend_lock);
 
@@ -2298,11 +2633,19 @@ zio_write_gang_block(zio_t *pio)
 	uint64_t resid = pio->io_size;
 	uint64_t lsize;
 	int copies = gio->io_prop.zp_copies;
-	int gbh_copies = MIN(copies + 1, spa_max_replication(spa));
+	int gbh_copies;
 	zio_prop_t zp;
 	int g, error;
-
 	int flags = METASLAB_HINTBP_FAVOR | METASLAB_GANG_HEADER;
+
+	/*
+	 * encrypted blocks need DVA[2] free so encrypted gang headers can't
+	 * have a third copy.
+	 */
+	gbh_copies = MIN(copies + 1, spa_max_replication(spa));
+	if (gio->io_prop.zp_encrypt && gbh_copies >= SPA_DVAS_PER_BP)
+		gbh_copies = SPA_DVAS_PER_BP - 1;
+
 	if (pio->io_flags & ZIO_FLAG_IO_ALLOCATING) {
 		ASSERT(pio->io_priority == ZIO_PRIORITY_ASYNC_WRITE);
 		ASSERT(!(pio->io_flags & ZIO_FLAG_NODATA));
@@ -2376,12 +2719,16 @@ zio_write_gang_block(zio_t *pio)
 
 		zp.zp_checksum = gio->io_prop.zp_checksum;
 		zp.zp_compress = ZIO_COMPRESS_OFF;
+		zp.zp_encrypt = gio->io_prop.zp_encrypt;
 		zp.zp_type = DMU_OT_NONE;
 		zp.zp_level = 0;
 		zp.zp_copies = gio->io_prop.zp_copies;
 		zp.zp_dedup = B_FALSE;
 		zp.zp_dedup_verify = B_FALSE;
 		zp.zp_nopwrite = B_FALSE;
+		bzero(zp.zp_salt, ZIO_DATA_SALT_LEN);
+		bzero(zp.zp_iv, ZIO_DATA_IV_LEN);
+		bzero(zp.zp_mac, ZIO_DATA_MAC_LEN);
 
 		cio = zio_write(zio, spa, txg, &gbh->zg_blkptr[g],
 		    abd_get_offset(pio->io_abd, pio->io_size - resid), lsize,
@@ -2460,6 +2807,7 @@ zio_nop_write(zio_t *zio)
 	if (BP_IS_HOLE(bp_orig) ||
 	    !(zio_checksum_table[BP_GET_CHECKSUM(bp)].ci_flags &
 	    ZCHECKSUM_FLAG_NOPWRITE) ||
+	    BP_IS_ENCRYPTED(bp) || BP_IS_ENCRYPTED(bp_orig) ||
 	    BP_GET_CHECKSUM(bp) != BP_GET_CHECKSUM(bp_orig) ||
 	    BP_GET_COMPRESS(bp) != BP_GET_COMPRESS(bp_orig) ||
 	    BP_GET_DEDUP(bp) != BP_GET_DEDUP(bp_orig) ||
@@ -2609,7 +2957,7 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 	 * pushed the I/O transforms.  That's an important optimization
 	 * because otherwise we'd compress/encrypt all dmu_sync() data twice.
 	 * However, we should never get a raw, override zio so in these
-	 * cases we can compare the io_data directly. This is useful because
+	 * cases we can compare the io_abd directly. This is useful because
 	 * it allows us to do dedup verification even if we don't have access
 	 * to the original data (for instance, if the encryption keys aren't
 	 * loaded).
@@ -3097,8 +3445,8 @@ zio_dva_unallocate(zio_t *zio, zio_gang_node_t *gn, blkptr_t *bp)
  * Try to allocate an intent log block.  Return 0 on success, errno on failure.
  */
 int
-zio_alloc_zil(spa_t *spa, uint64_t txg, blkptr_t *new_bp, uint64_t size,
-    boolean_t *slog)
+zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
+    uint64_t size, boolean_t *slog)
 {
 	int error = 1;
 	zio_alloc_list_t io_alloc_list;
@@ -3130,6 +3478,23 @@ zio_alloc_zil(spa_t *spa, uint64_t txg, blkptr_t *new_bp, uint64_t size,
 		BP_SET_LEVEL(new_bp, 0);
 		BP_SET_DEDUP(new_bp, 0);
 		BP_SET_BYTEORDER(new_bp, ZFS_HOST_BYTEORDER);
+
+		/*
+		 * encrypted blocks will require an IV and salt. We generate
+		 * these now since we will not be rewriting the bp at
+		 * rewrite time.
+		 */
+		if (os->os_encrypted) {
+			uint8_t iv[ZIO_DATA_IV_LEN];
+			uint8_t salt[ZIO_DATA_SALT_LEN];
+
+			BP_SET_CRYPT(new_bp, B_TRUE);
+			VERIFY0(spa_crypt_get_salt(spa,
+			    dmu_objset_id(os), salt));
+			VERIFY0(zio_crypt_generate_iv(iv));
+
+			zio_crypt_encode_params_bp(new_bp, salt, iv);
+		}
 	}
 
 	return (error);
@@ -3153,6 +3518,30 @@ zio_free_zil(spa_t *spa, uint64_t txg, blkptr_t *bp)
  * ==========================================================================
  */
 
+/*
+ * Late pipeline bypass for trim zios. Because our zio trim queues can be
+ * pretty long and we might want to quickly terminate trims for performance
+ * reasons, we check the following conditions:
+ * 1) If a manual trim was initiated with the queue full of auto trim zios,
+ *	we want to skip doing the auto trims, because they hold up the manual
+ *	trim unnecessarily. Manual trim processes all empty space anyway.
+ * 2) If the autotrim property of the pool is flipped to off, usually due to
+ *	performance reasons, we want to stop trying to do autotrims/
+ * 3) If a manual trim shutdown was requested, immediately terminate them.
+ * 4) If a pool vdev reconfiguration is imminent, we must discard all queued
+ *	up trims to let it proceed as quickly as possible.
+ */
+static inline boolean_t
+zio_trim_should_bypass(const zio_t *zio)
+{
+	ASSERT(ZIO_IS_TRIM(zio));
+	return ((zio->io_priority == ZIO_PRIORITY_AUTO_TRIM &&
+	    (zio->io_vd->vdev_top->vdev_man_trimming ||
+	    zio->io_spa->spa_auto_trim != SPA_AUTO_TRIM_ON)) ||
+	    (zio->io_priority == ZIO_PRIORITY_MAN_TRIM &&
+	    zio->io_spa->spa_man_trim_stop) ||
+	    zio->io_vd->vdev_trim_zios_stop);
+}
 
 /*
  * Issue an I/O to the underlying vdev. Typically the issue pipeline
@@ -3265,7 +3654,8 @@ zio_vdev_io_start(zio_t *zio)
 	}
 
 	if (vd->vdev_ops->vdev_op_leaf &&
-	    (zio->io_type == ZIO_TYPE_READ || zio->io_type == ZIO_TYPE_WRITE)) {
+	    (zio->io_type == ZIO_TYPE_READ || zio->io_type == ZIO_TYPE_WRITE ||
+	    ZIO_IS_TRIM(zio))) {
 
 		if (zio->io_type == ZIO_TYPE_READ && vdev_cache_read(zio))
 			return (ZIO_PIPELINE_CONTINUE);
@@ -3281,6 +3671,9 @@ zio_vdev_io_start(zio_t *zio)
 		zio->io_delay = gethrtime();
 	}
 
+	if (ZIO_IS_TRIM(zio) && zio_trim_should_bypass(zio))
+		return (ZIO_PIPELINE_CONTINUE);
+
 	vd->vdev_ops->vdev_op_io_start(zio);
 	return (ZIO_PIPELINE_STOP);
 }
@@ -3295,7 +3688,8 @@ zio_vdev_io_done(zio_t *zio)
 	if (zio_wait_for_children(zio, ZIO_CHILD_VDEV, ZIO_WAIT_DONE))
 		return (ZIO_PIPELINE_STOP);
 
-	ASSERT(zio->io_type == ZIO_TYPE_READ || zio->io_type == ZIO_TYPE_WRITE);
+	ASSERT(zio->io_type == ZIO_TYPE_READ ||
+	    zio->io_type == ZIO_TYPE_WRITE || ZIO_IS_TRIM(zio));
 
 	if (zio->io_delay)
 		zio->io_delay = gethrtime() - zio->io_delay;
@@ -3308,13 +3702,13 @@ zio_vdev_io_done(zio_t *zio)
 			vdev_cache_write(zio);
 
 		if (zio_injection_enabled && zio->io_error == 0)
-			zio->io_error = zio_handle_device_injection(vd,
-			    zio, EIO);
+			zio->io_error = zio_handle_device_injections(vd, zio,
+			    EIO, EILSEQ);
 
 		if (zio_injection_enabled && zio->io_error == 0)
 			zio->io_error = zio_handle_label_injection(zio, EIO);
 
-		if (zio->io_error) {
+		if (zio->io_error && !ZIO_IS_TRIM(zio)) {
 			if (!vdev_accessible(vd, zio)) {
 				zio->io_error = SET_ERROR(ENXIO);
 			} else {
@@ -3413,14 +3807,17 @@ zio_vdev_io_assess(zio_t *zio)
 	}
 
 	/*
-	 * If a cache flush returns ENOTSUP or ENOTTY, we know that no future
-	 * attempts will ever succeed. In this case we set a persistent bit so
-	 * that we don't bother with it in the future.
+	 * If a cache flush or discard returns ENOTSUP or ENOTTY, we know that
+	 * no future attempts will ever succeed. In this case we set a
+	 * persistent bit so that we don't bother with it in the future.
 	 */
 	if ((zio->io_error == ENOTSUP || zio->io_error == ENOTTY) &&
-	    zio->io_type == ZIO_TYPE_IOCTL &&
-	    zio->io_cmd == DKIOCFLUSHWRITECACHE && vd != NULL)
-		vd->vdev_nowritecache = B_TRUE;
+	    zio->io_type == ZIO_TYPE_IOCTL && vd != NULL) {
+		if (zio->io_cmd == DKIOCFLUSHWRITECACHE)
+			vd->vdev_nowritecache = B_TRUE;
+		if (zio->io_cmd == DKIOCFREE)
+			vd->vdev_notrim = B_TRUE;
+	}
 
 	if (zio->io_error)
 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
@@ -3460,6 +3857,146 @@ zio_vdev_io_bypass(zio_t *zio)
 
 	zio->io_flags |= ZIO_FLAG_IO_BYPASS;
 	zio->io_stage = ZIO_STAGE_VDEV_IO_ASSESS >> 1;
+}
+
+/*
+ * ==========================================================================
+ * Encrypt and store encryption parameters
+ * ==========================================================================
+ */
+
+
+/*
+ * This function is used for ZIO_STAGE_ENCRYPT. It is responsible for
+ * managing the storage of encryption parameters and passing them to the
+ * lower-level encryption functions.
+ */
+static int
+zio_encrypt(zio_t *zio)
+{
+	zio_prop_t *zp = &zio->io_prop;
+	spa_t *spa = zio->io_spa;
+	blkptr_t *bp = zio->io_bp;
+	uint64_t psize = BP_GET_PSIZE(bp);
+	dmu_object_type_t ot = BP_GET_TYPE(bp);
+	void *enc_buf = NULL;
+	abd_t *eabd = NULL;
+	uint8_t salt[ZIO_DATA_SALT_LEN];
+	uint8_t iv[ZIO_DATA_IV_LEN];
+	uint8_t mac[ZIO_DATA_MAC_LEN];
+	boolean_t no_crypt = B_FALSE;
+
+	/* the root zio already encrypted the data */
+	if (zio->io_child_type == ZIO_CHILD_GANG)
+		return (ZIO_PIPELINE_CONTINUE);
+
+	/* only ZIL blocks are re-encrypted on rewrite */
+	if (!IO_IS_ALLOCATING(zio) && ot != DMU_OT_INTENT_LOG)
+		return (ZIO_PIPELINE_CONTINUE);
+
+	if (!(zp->zp_encrypt || BP_IS_ENCRYPTED(bp))) {
+		BP_SET_CRYPT(bp, B_FALSE);
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
+	/* if we are doing raw encryption set the provided encryption params */
+	if (zio->io_flags & ZIO_FLAG_RAW_ENCRYPT) {
+		BP_SET_CRYPT(bp, B_TRUE);
+		BP_SET_BYTEORDER(bp, zp->zp_byteorder);
+		if (ot != DMU_OT_OBJSET)
+			zio_crypt_encode_mac_bp(bp, zp->zp_mac);
+		if (DMU_OT_IS_ENCRYPTED(ot))
+			zio_crypt_encode_params_bp(bp, zp->zp_salt, zp->zp_iv);
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
+	/* indirect blocks only maintain a cksum of the lower level MACs */
+	if (BP_GET_LEVEL(bp) > 0) {
+		BP_SET_CRYPT(bp, B_TRUE);
+		VERIFY0(zio_crypt_do_indirect_mac_checksum_abd(B_TRUE,
+		    zio->io_orig_abd, BP_GET_LSIZE(bp), BP_SHOULD_BYTESWAP(bp),
+		    mac));
+		zio_crypt_encode_mac_bp(bp, mac);
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
+	/*
+	 * Objset blocks are a special case since they have 2 256-bit MACs
+	 * embedded within them.
+	 */
+	if (ot == DMU_OT_OBJSET) {
+		ASSERT0(DMU_OT_IS_ENCRYPTED(ot));
+		ASSERT3U(BP_GET_COMPRESS(bp), ==, ZIO_COMPRESS_OFF);
+		BP_SET_CRYPT(bp, B_TRUE);
+		VERIFY0(spa_do_crypt_objset_mac_abd(B_TRUE, spa,
+		    zio->io_bookmark.zb_objset, zio->io_abd, psize,
+		    BP_SHOULD_BYTESWAP(bp)));
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
+	/* unencrypted object types are only authenticated with a MAC */
+	if (!DMU_OT_IS_ENCRYPTED(ot)) {
+		BP_SET_CRYPT(bp, B_TRUE);
+		VERIFY0(spa_do_crypt_mac_abd(B_TRUE, spa,
+		    zio->io_bookmark.zb_objset, zio->io_abd, psize, mac));
+		zio_crypt_encode_mac_bp(bp, mac);
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
+	/*
+	 * Later passes of sync-to-convergence may decide to rewrite data
+	 * in place to avoid more disk reallocations. This presents a problem
+	 * for encryption because this consitutes rewriting the new data with
+	 * the same encryption key and IV. However, this only applies to blocks
+	 * in the MOS (particularly the spacemaps) and we do not encrypt the
+	 * MOS. We assert that the zio is allocating or an intent log write
+	 * to enforce this.
+	 */
+	ASSERT(IO_IS_ALLOCATING(zio) || ot == DMU_OT_INTENT_LOG);
+	ASSERT(BP_GET_LEVEL(bp) == 0 || ot == DMU_OT_INTENT_LOG);
+	ASSERT(spa_feature_is_active(spa, SPA_FEATURE_ENCRYPTION));
+	ASSERT3U(psize, !=, 0);
+
+	enc_buf = zio_buf_alloc(psize);
+	eabd = abd_get_from_buf(enc_buf, psize);
+	abd_take_ownership_of_buf(eabd, B_TRUE);
+
+	/*
+	 * For an explanation of what encryption parameters are stored
+	 * where, see the block comment in zio_crypt.c.
+	 */
+	if (ot == DMU_OT_INTENT_LOG) {
+		zio_crypt_decode_params_bp(bp, salt, iv);
+	} else {
+		BP_SET_CRYPT(bp, B_TRUE);
+	}
+
+	/* Perform the encryption. This should not fail */
+	VERIFY0(spa_do_crypt_abd(B_TRUE, spa, zio->io_bookmark.zb_objset, bp,
+	    zio->io_txg, psize, zio->io_abd, eabd, iv, mac, salt, &no_crypt));
+
+	/* encode encryption metadata into the bp */
+	if (ot == DMU_OT_INTENT_LOG) {
+		/*
+		 * ZIL blocks store the MAC in the embedded checksum, so the
+		 * transform must always be applied.
+		 */
+		zio_crypt_encode_mac_zil(enc_buf, mac);
+		zio_push_transform(zio, eabd, psize, psize, NULL);
+	} else {
+		BP_SET_CRYPT(bp, B_TRUE);
+		zio_crypt_encode_params_bp(bp, salt, iv);
+		zio_crypt_encode_mac_bp(bp, mac);
+
+		if (no_crypt) {
+			ASSERT3U(ot, ==, DMU_OT_DNODE);
+			abd_free(eabd);
+		} else {
+			zio_push_transform(zio, eabd, psize, psize, NULL);
+		}
+	}
+
+	return (ZIO_PIPELINE_CONTINUE);
 }
 
 /*
@@ -3523,8 +4060,8 @@ zio_checksum_verify(zio_t *zio)
 		if (error == ECKSUM &&
 		    !(zio->io_flags & ZIO_FLAG_SPECULATIVE)) {
 			zfs_ereport_start_checksum(zio->io_spa,
-			    zio->io_vd, zio, zio->io_offset,
-			    zio->io_size, NULL, &info);
+			    zio->io_vd, &zio->io_bookmark, zio,
+			    zio->io_offset, zio->io_size, NULL, &info);
 		}
 	}
 
@@ -3824,7 +4361,7 @@ zio_done(zio_t *zio)
 	if (zio->io_delay >= MSEC2NSEC(zio_delay_max)) {
 		if (zio->io_vd != NULL && !vdev_is_dead(zio->io_vd))
 			zfs_ereport_post(FM_EREPORT_ZFS_DELAY, zio->io_spa,
-			    zio->io_vd, zio, 0, 0);
+			    zio->io_vd, &zio->io_bookmark, zio, 0, 0);
 	}
 
 	if (zio->io_error) {
@@ -3837,7 +4374,7 @@ zio_done(zio_t *zio)
 		if (zio->io_error != ECKSUM && zio->io_vd != NULL &&
 		    !vdev_is_dead(zio->io_vd))
 			zfs_ereport_post(FM_EREPORT_ZFS_IO, zio->io_spa,
-			    zio->io_vd, zio, 0, 0);
+			    zio->io_vd, &zio->io_bookmark, zio, 0, 0);
 
 		if ((zio->io_error == EIO || !(zio->io_flags &
 		    (ZIO_FLAG_SPECULATIVE | ZIO_FLAG_DONT_PROPAGATE))) &&
@@ -3846,9 +4383,9 @@ zio_done(zio_t *zio)
 			 * For logical I/O requests, tell the SPA to log the
 			 * error and generate a logical data ereport.
 			 */
-			spa_log_error(zio->io_spa, zio);
+			spa_log_error(zio->io_spa, &zio->io_bookmark);
 			zfs_ereport_post(FM_EREPORT_ZFS_DATA, zio->io_spa,
-			    NULL, zio, 0, 0);
+			    NULL, &zio->io_bookmark, zio, 0, 0);
 		}
 	}
 
@@ -4046,6 +4583,7 @@ static zio_pipe_stage_t *zio_pipeline[] = {
 	zio_free_bp_init,
 	zio_issue_async,
 	zio_write_compress,
+	zio_encrypt,
 	zio_checksum_generate,
 	zio_nop_write,
 	zio_ddt_read_start,
@@ -4219,4 +4757,13 @@ MODULE_PARM_DESC(zfs_sync_pass_rewrite,
 module_param(zio_dva_throttle_enabled, int, 0644);
 MODULE_PARM_DESC(zio_dva_throttle_enabled,
 	"Throttle block allocations in the ZIO pipeline");
+
+module_param(zfs_trim, int, 0644);
+MODULE_PARM_DESC(zfs_trim, "Enable TRIM");
+
+module_param(zfs_trim_min_ext_sz, int, 0644);
+MODULE_PARM_DESC(zfs_trim_min_ext_sz, "Minimum size to TRIM");
+
+module_param(zfs_trim_sync, int, 0644);
+MODULE_PARM_DESC(zfs_trim_sync, "Issue TRIM commands synchronously");
 #endif
